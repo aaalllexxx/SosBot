@@ -29,7 +29,8 @@ def set_users():
     if room and name and chat_id:
         user = User(room=room,
                     name=name,
-                    chat_id=chat_id)
+                    chat_id=chat_id,
+                    role="user")
         db.session.add(user)
         db.session.commit()
         return '{"status": 1, "desc": "Added to database"}'
@@ -44,9 +45,9 @@ def get_users():
     users = {}
     for user in User.query.all():
         if not users.get(user.room):
-            users[user.room] = [[user.id, user.name, str(user.chat_id)]]
+            users[user.room] = [[user.id, user.name, str(user.chat_id), user.role]]
         else:
-            users[user.room].append([user.id, user.name, str(user.chat_id)])
+            users[user.room].append([user.id, user.name, str(user.chat_id), user.role])
     return json.dumps(users)
 
 
@@ -73,7 +74,8 @@ def get_user_by_chat(chat_id):
             "user": {
                 "id": user.id,
                 "name": user.name,
-                "room": user.room
+                "room": user.room,
+                "role": user.role or "user"
             }
         })
     else:
@@ -92,3 +94,20 @@ def get_room(room):
             "chat_id": user.chat_id,
         })
     return json.dumps(resp)
+
+
+@app.route("/api/user/set_role")
+def set_admin():
+    if not check_api():
+        return '{"status": -3, "desc": "api_key required"}'
+
+    chat_id = request.args.get("chat_id")
+    role = request.args.get("role")
+    if chat_id and role:
+        user = User.query.filter_by(chat_id=chat_id).first()
+        if user and user.chat_id == chat_id:
+            user.role = role
+            db.session.commit()
+            return '{"status": 1, "desc": "success"}'
+        return '{"status": -6, "desc": "User not exist"}'
+    return '{"status": -5, "desc": "not enough args"}'

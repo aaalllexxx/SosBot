@@ -1,10 +1,13 @@
 import datetime
 import json
 import os
+import time
+import uuid
 
 import requests
 from aiogram import Bot, Dispatcher, executor
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, \
+    InlineKeyboardButton, CallbackQuery
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from settings import base_link, debug
@@ -14,6 +17,8 @@ bot = Bot(os.environ.get("TG_TOKEN"))
 dp = Dispatcher(bot)
 scheduler = AsyncIOScheduler()
 
+page_size = 5
+
 hoover_state = {
     "status": "free",
     "floor": 2,
@@ -22,10 +27,15 @@ hoover_state = {
     "rent_time": ""
 }
 
+complains_pages = {}
+users_pages = {}
+
 response = {
     "floor": 0,
     "location": ""
 }
+
+priv = ["user", "duty", "admin", "owner"]
 
 stop_rent_user = ""
 
@@ -43,6 +53,19 @@ def get_user(chat_id) -> bool | dict:
         return False
 
 
+def get_possibilities(role):
+    return priv[:priv.index(role) + 1]
+
+
+def is_admin(chat_id) -> bool:
+    user = get_user(chat_id)
+    if user:
+        role = user["role"]
+        if "admin" in get_possibilities(role):
+            return True
+    return False
+
+
 def get_all_users():
     link = base_link + f"/api/get_users?api_key={os.environ.get('LOCAL_API_TOKEN')}"
     resp = requests.get(link).json()
@@ -53,6 +76,47 @@ def get_requests():
     with open("items.json") as file:
         content = json.loads(file.read())
     return content
+
+
+def get_complains():
+    with open("complains.json") as file:
+        content = json.loads(file.read())
+    return content
+
+
+def get_users_list():
+    users = get_all_users()
+    users_list = []
+    for room, users_in_room in users.items():
+        for user in users_in_room:
+            user.append(room)
+            users_list.append(user)
+
+    return users_list
+
+
+async def add_complain(chat_id, name, complain_text):
+    with open("cooldown.json") as file:
+        cooldowns = json.loads(file.read())
+    chat_id = str(chat_id)
+    if cooldowns.get(chat_id) and round(time.time()) - cooldowns[chat_id] < 600:
+        return await bot.send_message(chat_id,
+                                      f"Вы уже отправляли жалобу недавно. "
+                                      f"Подождите ещё {10 - (round(time.time()) - cooldowns[chat_id]) // 60} минут")
+    data = get_complains()
+    data[uuid.uuid4().hex] = {"from_user": chat_id,
+                              "name": name,
+                              "text": complain_text,
+                              "time": datetime.datetime.now().strftime('%d-%m-%Y-%H-%M-%S')
+                              }
+    with open("complains.json", "w") as file:
+        file.write(json.dumps(data))
+
+    cooldowns[chat_id] = round(time.time())
+
+    with open("cooldown.json", "w") as file:
+        file.write(json.dumps(cooldowns))
+    return await bot.send_message(chat_id, "Жалоба отправлена.")
 
 
 def create_request(chat_id, item):
@@ -87,6 +151,27 @@ async def notify(bot: Bot):
     file.close()
 
 
+def config_message(callback_query):
+    message = callback_query.message
+
+    complains = get_complains()
+    complains = list(complains.values())
+    if not (message.chat.id in list(complains_pages)):
+        complains_pages[message.chat.id] = 0
+
+    complain_user = get_user(complains[complains_pages[message.chat.id]]["from_user"])
+
+    if complain_user:
+        mes = f"Жалоба №{complains_pages[message.chat.id] + 1} от {complain_user.get('name') or 'Неизвестно'} из комнаты {complain_user.get('room') or 'Неизвестно'}.\n" \
+              f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
+              f"{complains[complains_pages[message.chat.id]]['text']}."
+    else:
+        mes = f"Жалоба №{complains_pages[message.chat.id] + 1}" \
+              f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
+              f"{complains[complains_pages[message.chat.id]]['text']}."
+    return mes
+
+
 @dp.message_handler(commands=["start"])
 async def start(message: Message):
     await message.answer("Привет! чтобы начать пользоваться ботом тебе надо зарегистрироваться.\n"
@@ -102,8 +187,8 @@ async def register(message: Message):
     args = message.get_args()
     if args and len(args) >= 2:
         args = args.split()
-        name = args[0].strip("{").strip("}")
-        room = args[1].strip("{").strip("}")
+        name = args[0].strip("{").strip("}").strip()
+        room = args[1].strip("{").strip("}").strip()
         chat_id = message.chat.id
         api_key = os.environ.get("LOCAL_API_TOKEN")
         link = base_link + f"/api/set_user?name={name}&room={room}&chat_id={chat_id}&api_key={api_key}"
@@ -132,8 +217,6 @@ async def register(message: Message):
 @dp.message_handler(commands=["clear"])
 async def clear(message: Message):
     args = message.get_args()
-    print(args)
-    print(debug)
     if debug and args:
         link = base_link + f"/clear/{args}?api_key={os.environ.get('LOCAL_API_TOKEN')}"
         resp = requests.get(link).json()
@@ -146,17 +229,35 @@ async def clear(message: Message):
 @dp.message_handler(lambda message: message.text.lower() == "список команд")
 @dp.message_handler(commands=["help"])
 async def help_answer(message: Message):
-    if get_user(message.chat.id):
-        await message.answer("Я умею:\n"
-                             "/my_duty - дата моего дежурства\n"
-                             "/locate_hoover - найти пылесос\n"
-                             "/rent - взять пылесос в пользование\n"
-                             "/ask_for {название нужной вещи} - отправить всем пользователям сообщение "
-                             "с просьбой о конкретной вещи\n"
-                             "/have {название вещи} - ответить на просьбу о нужной вещи\n"
-                             "/complain {имя} - {претензия} - отправляет админам жалобу на человека,"
-                             "имя которого вы вписали (обязательно разделять имя и претензию тире)\n"
-                             "/me - информация о вашем аккаунте", reply_markup=default_markup)
+    user = get_user(message.chat.id)
+    if user:
+        possibilities = get_possibilities(user["role"])
+        if "user" in possibilities:
+            await message.answer("возможности уровня 'пользователь':\n"
+                                 "/my_duty - дата моего дежурства\n"
+                                 "/locate_hoover - найти пылесос\n"
+                                 "/rent - взять пылесос в пользование\n"
+                                 "/ask_for {название нужной вещи} - отправить всем пользователям сообщение "
+                                 "с просьбой о конкретной вещи\n"
+                                 "/have {название вещи} - ответить на просьбу о нужной вещи\n"
+                                 "/complain {имя} - {претензия} - отправляет админам жалобу на человека,"
+                                 "имя которого вы вписали (обязательно разделять имя и претензию тире)\n"
+                                 "/me - информация о вашем аккаунте", reply_markup=default_markup)
+        if "duty" in possibilities:
+            await message.answer("возможности уровня 'дежурный':\n"
+                                 "/set_hoover - изменить положение пылесоса, если кто-то забыл закончить аренду\n"
+                                 "/task_list - список задач дежурного\n",
+                                 reply_markup=default_markup)
+        if "admin" in possibilities:
+            await message.answer("возможности уровня 'администратор':\n"
+                                 "/ban {chat_id} - удалить пользователя\n"
+                                 "/register_user {name} {room} - зарегистрировать пользователя\n"
+                                 "/get_users - вывести всех пользователей\n"
+                                 "/get_duty - вывести комнату, которая дежурит\n"
+                                 "/set_role {chat_id} {role} - установить роль пользователю\n"
+                                 "/view_complains - просмотреть все жалобы\n\n"
+                                 "Отправьте xlsx файл, чтобы заменить график дежурств",
+                                 reply_markup=default_markup)
     else:
         await message.answer("Сначала надо зарегистрироваться. \n"
                              "``` /register {имя} {номер-комнаты}```\n"
@@ -223,14 +324,14 @@ async def rent(message: Message):
 
 @dp.message_handler(lambda message: message.text.lower() == "остановить аренду")
 @dp.message_handler(commands=["stop"])
-async def stop_rent(message: Message):
+async def stop_rent(message: Message, duty=False):
     global stop_rent_user
     user = get_user(message.chat.id)
     if not user:
         return await message.answer("Сначала надо зарегистрироваться. \n"
                                     "``` /register {имя} {номер-комнаты}```\n"
                                     "номер комнаты указывать в формате х-х-ххх", parse_mode="Markdown")
-    if user["room"] and user["room"] == hoover_state["location"]:
+    if user["room"] and (user["room"] == hoover_state["location"] or duty):
         stop_rent_user = message.chat.id
         markup = ReplyKeyboardMarkup(resize_keyboard=True)
         buttons = [
@@ -259,6 +360,8 @@ async def ask_for(message: Message):
                                     "``` /register {имя} {номер-комнаты}```\n"
                                     "номер комнаты указывать в формате х-х-ххх", parse_mode="Markdown")
     argument = message.get_args()
+    if len(argument) < 2:
+        return await message.answer("Запрос должен содержать минимум 3 символа.")
     create_request(message.chat.id, argument)
     for room, persons in users.items():
         for person in persons:
@@ -292,13 +395,124 @@ async def me(message: Message):
     if not user:
         return await message.answer("Сначала надо зарегистрироваться. \n"
                                     "``` /register {имя} {номер-комнаты}```\n")
-    return await message.answer(f"Имя: {user['name']}\nКомната: {user['room']}\nID чата: {message.chat.id}",
-                                reply_markup=default_markup)
+    return await message.answer(
+        f"Имя: {user['name']}\n"
+        f"Комната: {user['room']}\n"
+        f"ID чата: {message.chat.id}\n"
+        f"Привилегия: {user['role']}",
+        reply_markup=default_markup)
 
 
 @dp.message_handler(commands=["complain"])
 async def complain(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+
     args = message.get_args()
+    if args:
+        args = args.split("-")
+        return await add_complain(message.chat.id, args[0], args[1])
+    return await message.answer("Ошибка, жалоба не отправлена. Введите все нужные аргументы через '-'")
+
+
+@dp.message_handler(commands=["view_complains"])
+async def view_complains(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+
+    if not is_admin(message.chat.id):
+        return
+
+    complains = get_complains()
+    complains = list(complains.values())
+    if len(complains) == 0:
+        return await message.answer("Жалоб нет.")
+    if not (message.chat.id in list(complains_pages)):
+        complains_pages[message.chat.id] = 0
+
+    complain_user = get_user(complains[complains_pages[message.chat.id]]["from_user"])
+
+    if complain_user:
+        mes = f"Жалоба №{complains_pages[message.chat.id] + 1} от {complain_user.get('name') or 'Неизвестно'} из комнаты {complain_user.get('room') or 'Неизвестно'}.\n" \
+              f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
+              f"{complains[complains_pages[message.chat.id]]['text']}."
+    else:
+        mes = f"Жалоба №{complains_pages[message.chat.id] + 1}" \
+              f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
+              f"{complains[complains_pages[message.chat.id]]['text']}."
+
+    keyboard_markup = InlineKeyboardMarkup(row_width=2)
+    keyboard_markup.add(InlineKeyboardButton("назад", callback_data="prev_comp_page"),
+                        InlineKeyboardButton("вперёд", callback_data="next_comp_page")
+                        )
+
+    if is_admin(message.chat.id):
+        return await message.answer(mes, reply_markup=keyboard_markup)
+
+
+@dp.message_handler(commands=["set_hoover"])
+async def set_hoover(message: Message):
+    global stop_rent_user
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+
+    pos = get_possibilities(user["role"])
+    if "duty" in pos:
+        await stop_rent(message, True)
+
+
+@dp.message_handler(commands=["set_role"])
+async def set_role(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+
+    arguments = message.get_args()
+    if arguments:
+        arguments = arguments.split()
+    if is_admin(message.chat.id) and len(arguments) > 1:
+        link = base_link + f"/api/user/set_role?chat_id={arguments[0]}&role={arguments[1]}&api_key={os.environ.get('LOCAL_API_TOKEN')}"
+        resp = requests.get(link).json()
+        if resp["status"] > 0:
+            return await message.answer(f"Выданы права {arguments[1]}.")
+        return await message.answer(f"Права {arguments[1]} не выданы. Ошибка: {resp['desc']}")
+
+
+@dp.message_handler(commands=["get_users"])
+async def get_users(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+    pos = get_possibilities(user["role"])
+    if "admin" in pos:
+        users = get_users_list()
+
+        markup = InlineKeyboardMarkup()
+
+        markup.add(
+            InlineKeyboardButton("назад", callback_data="users_prev_page"),
+            InlineKeyboardButton("вперёд", callback_data="users_next_page")
+        )
+
+        users_pages[message.chat.id] = 0
+
+        page = users_pages[message.chat.id]
+        mes = ""
+        for i in range(page_size * page, page_size * page + page_size):
+            if i < len(users):
+                mes += f"{i + 1}. Имя: {users[i][1]},\nChat_id: {users[i][2]},\nКомната: {users[i][4]},\nСтатус: {users[i][3]}\n\n"
+            else:
+                break
+
+        return await message.answer(mes, reply_markup=markup)
 
 
 @dp.message_handler()
@@ -334,12 +548,119 @@ async def on_message(message: Message):
             response["floor"] = 0
             response["location"] = ""
             stop_rent_user = ""
-            return await message.answer("Пылесос снят с аренды.", reply_markup=default_markup)
+            return await message.answer("Положение пылесоса установлено.", reply_markup=default_markup)
 
         elif message.text.lower() == "нет":
             response["location"] = ""
             return await message.answer("Где вы оставили пылесос? (отправьте фразой, например: 'у куллера')",
                                         reply_markup=ReplyKeyboardRemove())
+
+
+@dp.callback_query_handler(lambda callback: callback.data == "next_comp_page")
+async def next_comp_page(callback_query: CallbackQuery):
+    if not (callback_query.message.chat.id in complains_pages):
+        complains_pages[callback_query.message.chat.id] = 0
+
+    if complains_pages[callback_query.message.chat.id] < len(list(get_complains())) - 1:
+        complains_pages[callback_query.message.chat.id] += 1
+    else:
+        complains_pages[callback_query.message.chat.id] = 0
+
+    keyboard_markup = InlineKeyboardMarkup(row_width=2)
+    keyboard_markup.add(InlineKeyboardButton("назад", callback_data="prev_comp_page"),
+                        InlineKeyboardButton("вперёд", callback_data="next_comp_page")
+                        )
+    mes = config_message(callback_query)
+    try:
+        await callback_query.message.edit_text(mes, reply_markup=keyboard_markup)
+    except:
+        pass
+    await callback_query.answer()
+
+
+@dp.callback_query_handler(lambda callback: callback.data == "prev_comp_page")
+async def next_comp_page(callback_query: CallbackQuery):
+    if not (callback_query.message.chat.id in complains_pages):
+        complains_pages[callback_query.message.chat.id] = 0
+
+    if complains_pages[callback_query.message.chat.id] > 0:
+        complains_pages[callback_query.message.chat.id] -= 1
+    else:
+        complains_pages[callback_query.message.chat.id] = len(list(get_complains())) - 1
+
+    keyboard_markup = InlineKeyboardMarkup(row_width=2)
+    keyboard_markup.add(InlineKeyboardButton("назад", callback_data="prev_comp_page"),
+                        InlineKeyboardButton("вперёд", callback_data="next_comp_page")
+                        )
+
+    mes = config_message(callback_query)
+    try:
+        await callback_query.message.edit_text(mes, reply_markup=keyboard_markup)
+    except:
+        pass
+    await callback_query.answer()
+
+
+@dp.callback_query_handler(lambda callback: callback.data == "users_prev_page")
+async def prev_users_page(callback_query: CallbackQuery):
+    users = get_users_list()
+    page_count = len(users) // page_size + 1 * ((len(users) % page_size) != 0) - 1
+    if not (callback_query.message.chat.id in users_pages):
+        users_pages[callback_query.message.chat.id] = 0
+
+    if users_pages[callback_query.message.chat.id] > 0:
+        users_pages[callback_query.message.chat.id] -= 1
+    else:
+        users_pages[callback_query.message.chat.id] = page_count
+
+    keyboard_markup = InlineKeyboardMarkup(row_width=2)
+    keyboard_markup.add(InlineKeyboardButton("назад", callback_data="users_prev_page"),
+                        InlineKeyboardButton("вперёд", callback_data="users_next_page")
+                        )
+
+    page = users_pages[callback_query.message.chat.id]
+    mes = ""
+    for i in range(page_size * page, page_size * page + page_size):
+        if i < len(users):
+            mes += f"{i + 1}. Имя: {users[i][1]},\nChat_id: {users[i][2]},\nКомната: {users[i][4]},\nСтатус: {users[i][3]}\n\n"
+        else:
+            break
+    try:
+        await callback_query.message.edit_text(mes, reply_markup=keyboard_markup)
+    except:
+        pass
+    await callback_query.answer()
+
+
+@dp.callback_query_handler(lambda callback: callback.data == "users_next_page")
+async def next_users_page(callback_query: CallbackQuery):
+    users = get_users_list()
+    page_count = len(users) // page_size + 1 * ((len(users) % page_size) != 0) - 1
+    if not (callback_query.message.chat.id in users_pages):
+        users_pages[callback_query.message.chat.id] = 0
+
+    if users_pages[callback_query.message.chat.id] < page_count:
+        users_pages[callback_query.message.chat.id] += 1
+    else:
+        users_pages[callback_query.message.chat.id] = 0
+
+    keyboard_markup = InlineKeyboardMarkup(row_width=2)
+    keyboard_markup.add(InlineKeyboardButton("назад", callback_data="users_prev_page"),
+                        InlineKeyboardButton("вперёд", callback_data="users_next_page")
+                        )
+
+    page = users_pages[callback_query.message.chat.id]
+    mes = ""
+    for i in range(page_size * page, page_size * page + page_size):
+        if i < len(users):
+            mes += f"{i + 1}. Имя: {users[i][1]},\nChat_id: {users[i][2]},\nКомната: {users[i][4]},\nСтатус: {users[i][3]}\n\n"
+        else:
+            break
+    try:
+        await callback_query.message.edit_text(mes, reply_markup=keyboard_markup)
+    except:
+        pass
+    await callback_query.answer()
 
 
 if __name__ == "__main__":

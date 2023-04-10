@@ -7,3 +7,4 @@ class User(db.Model):
     room = db.Column(db.String(10))
     name = db.Column(db.String(100))
     chat_id = db.Column(db.String(256))
+    role = db.Column(db.String(256))
