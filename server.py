@@ -111,3 +111,19 @@ def set_admin():
             return '{"status": 1, "desc": "success"}'
         return '{"status": -6, "desc": "User not exist"}'
     return '{"status": -5, "desc": "not enough args"}'
+
+
+@app.route("/api/user/delete")
+def delete_user():
+    if not check_api():
+        return '{"status": -3, "desc": "api_key required"}'
+
+    chat_id = request.args.get("chat_id")
+    if chat_id:
+        user = User.query.filter_by(chat_id=chat_id).first()
+        if user and user.chat_id == chat_id:
+            db.session.delete(user)
+            db.session.commit()
+            return '{"status": 1, "desc": "success"}'
+        return '{"status": -6, "desc": "User not exist"}'
+    return '{"status": -5, "desc": "not enough args"}'

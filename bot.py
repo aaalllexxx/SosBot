@@ -7,7 +7,7 @@ import uuid
 import requests
 from aiogram import Bot, Dispatcher, executor
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, \
-    InlineKeyboardButton, CallbackQuery
+    InlineKeyboardButton, CallbackQuery, ContentType
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from settings import base_link, debug
@@ -42,6 +42,8 @@ stop_rent_user = ""
 default_markup = ReplyKeyboardMarkup(resize_keyboard=True)
 default_markup.add("Где пылесос?")
 default_markup.add("Список команд")
+
+notify_time = [12, 30]
 
 
 def get_user(chat_id) -> bool | dict:
@@ -99,10 +101,10 @@ async def add_complain(chat_id, name, complain_text):
     with open("cooldown.json") as file:
         cooldowns = json.loads(file.read())
     chat_id = str(chat_id)
-    if cooldowns.get(chat_id) and round(time.time()) - cooldowns[chat_id] < 600:
+    if cooldowns.get(chat_id) and round(time.time()) - cooldowns[chat_id] < 300:
         return await bot.send_message(chat_id,
                                       f"Вы уже отправляли жалобу недавно. "
-                                      f"Подождите ещё {10 - (round(time.time()) - cooldowns[chat_id]) // 60} минут")
+                                      f"Подождите ещё {5 - (round(time.time()) - cooldowns[chat_id]) // 60} минут")
     data = get_complains()
     data[uuid.uuid4().hex] = {"from_user": chat_id,
                               "name": name,
@@ -133,6 +135,17 @@ def delete_request(item):
         file.write(json.dumps(_requests))
 
 
+def get_duty_room():
+    file = pd.ExcelFile("data/data.xlsx")
+    df: pd.DataFrame = file.parse(file.sheet_names[0])
+    tim: dict = df.to_dict()
+    for room, date in tim.items():
+        date: dict
+        date: pd.Timestamp = date[0]
+        if date.strftime('%d-%m-%Y') == datetime.datetime.now().strftime('%d-%m-%Y'):
+            return room
+
+
 async def notify(bot: Bot):
     file = pd.ExcelFile("data/data.xlsx")
     df: pd.DataFrame = file.parse(file.sheet_names[0])
@@ -141,34 +154,60 @@ async def notify(bot: Bot):
         date: dict
         date: pd.Timestamp = date[0]
         if date.strftime('%d-%m-%Y') == datetime.datetime.now().strftime(
-                '%d-%m-%Y') and datetime.datetime.now().hour.real == 12 and datetime.datetime.now().minute.real == 30:
+                '%d-%m-%Y') and datetime.datetime.now().hour.real == notify_time[0] \
+                and datetime.datetime.now().minute.real == notify_time[1]:
             link = base_link + f"/api/room/{room}?api_key={os.environ.get('LOCAL_API_TOKEN')}"
             resp = requests.get(link).json()
 
             if resp["status"] > 0:
                 for resident in resp["room"]["residents"]:
+                    user = get_user(resident["chat_id"])
+                    pos = get_possibilities(user['role'])
+                    if not ("duty" in pos):
+                        link = base_link + f"/api/user/set_role?chat_id={resident['chat_id']}&role=duty&api_key={os.environ.get('LOCAL_API_TOKEN')}"
+                        requests.get(link)
                     await bot.send_message(resident["chat_id"], "Поздравляю! Сегодня день вашего дежурства!")
+        else:
+            link = base_link + f"/api/room/{room}?api_key={os.environ.get('LOCAL_API_TOKEN')}"
+            resp = requests.get(link).json()
+
+            if resp["status"] > 0:
+                for resident in resp["room"]["residents"]:
+                    user = get_user(resident["chat_id"])
+                    pos = get_possibilities(user['role'])
+                    if not ("admin" in pos):
+                        link = base_link + f"/api/user/set_role?chat_id={resident['chat_id']}&role=user&api_key={os.environ.get('LOCAL_API_TOKEN')}"
+                        requests.get(link)
     file.close()
 
 
-def config_message(callback_query):
-    message = callback_query.message
+def config_message(query):
+    message = query.message if not isinstance(query, Message) else query
 
     complains = get_complains()
-    complains = list(complains.values())
+    cl = []
+    for key, value in complains.items():
+        value["id"] = key
+        cl.append(value)
+    complains = cl
+    if len(complains) == 0:
+        mes = "Жалоб нет."
     if not (message.chat.id in list(complains_pages)):
         complains_pages[message.chat.id] = 0
 
     complain_user = get_user(complains[complains_pages[message.chat.id]]["from_user"])
 
     if complain_user:
-        mes = f"Жалоба №{complains_pages[message.chat.id] + 1} от {complain_user.get('name') or 'Неизвестно'} из комнаты {complain_user.get('room') or 'Неизвестно'}.\n" \
+        mes = f"ID: {complains[complains_pages[message.chat.id]]['id']}\n\n" \
+              f"Жалоба №{complains_pages[message.chat.id] + 1} от {complain_user.get('name') or 'Неизвестно'} из комнаты {complain_user.get('room') or 'Неизвестно'}.\n" \
               f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
               f"{complains[complains_pages[message.chat.id]]['text']}."
     else:
-        mes = f"Жалоба №{complains_pages[message.chat.id] + 1}" \
+        mes = f"ID: {complains[complains_pages[message.chat.id]]['id']}\n\n" \
+              f"Жалоба №{complains_pages[message.chat.id] + 1}" \
               f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
               f"{complains[complains_pages[message.chat.id]]['text']}."
+
     return mes
 
 
@@ -251,7 +290,6 @@ async def help_answer(message: Message):
         if "admin" in possibilities:
             await message.answer("возможности уровня 'администратор':\n"
                                  "/ban {chat_id} - удалить пользователя\n"
-                                 "/register_user {name} {room} - зарегистрировать пользователя\n"
                                  "/get_users - вывести всех пользователей\n"
                                  "/get_duty - вывести комнату, которая дежурит\n"
                                  "/set_role {chat_id} {role} - установить роль пользователю\n"
@@ -262,6 +300,8 @@ async def help_answer(message: Message):
         await message.answer("Сначала надо зарегистрироваться. \n"
                              "``` /register {имя} {номер-комнаты}```\n"
                              "номер комнаты указывать в формате х-х-ххх", parse_mode="Markdown")
+    await message.answer(
+        "ВАЖНО! указывайте аргументы без фигурных скобок и других доп. знаков, а также не ставьте лишних пробелов.")
 
 
 @dp.message_handler(commands=["my_duty"])
@@ -427,24 +467,7 @@ async def view_complains(message: Message):
     if not is_admin(message.chat.id):
         return
 
-    complains = get_complains()
-    complains = list(complains.values())
-    if len(complains) == 0:
-        return await message.answer("Жалоб нет.")
-    if not (message.chat.id in list(complains_pages)):
-        complains_pages[message.chat.id] = 0
-
-    complain_user = get_user(complains[complains_pages[message.chat.id]]["from_user"])
-
-    if complain_user:
-        mes = f"Жалоба №{complains_pages[message.chat.id] + 1} от {complain_user.get('name') or 'Неизвестно'} из комнаты {complain_user.get('room') or 'Неизвестно'}.\n" \
-              f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
-              f"{complains[complains_pages[message.chat.id]]['text']}."
-    else:
-        mes = f"Жалоба №{complains_pages[message.chat.id] + 1}" \
-              f"Объект жалобы: {complains[complains_pages[message.chat.id]]['name']}.\n\n" \
-              f"{complains[complains_pages[message.chat.id]]['text']}."
-
+    mes = config_message(message)
     keyboard_markup = InlineKeyboardMarkup(row_width=2)
     keyboard_markup.add(InlineKeyboardButton("назад", callback_data="prev_comp_page"),
                         InlineKeyboardButton("вперёд", callback_data="next_comp_page")
@@ -515,9 +538,71 @@ async def get_users(message: Message):
         return await message.answer(mes, reply_markup=markup)
 
 
+@dp.message_handler(commands=["ban"])
+async def ban(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+    pos = get_possibilities(user["role"])
+    if "admin" in pos:
+        argument = message.get_args()
+        if argument:
+            ban_user = get_user(argument)
+            if ban_user and len(pos) >= len(get_possibilities(ban_user["role"])):
+                link = base_link + f"/api/user/delete?api_key={os.environ.get('LOCAL_API_TOKEN')}&chat_id={argument}"
+                resp = requests.get(link).json()
+                if resp["status"] > 0:
+                    return await message.answer("Пользователь удалён.")
+            elif not ban_user:
+                return await message.answer(f"Пользователь не удалён. Ошибка: пользователь не найден")
+            return await message.answer(
+                f"Пользователь не удалён. Ошибка: вы не можете удалить пользователя с большей привилегией")
+        return await message.answer(f"Пользователь не удалён. Ошибка: введите ID удаляемого пользователя")
+
+
+@dp.message_handler(commands=["get_duty"])
+async def get_duty(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+
+    if is_admin(message.chat.id):
+        return await message.answer(f"Сегодня дежурит комната {get_duty_room()}")
+
+
+@dp.message_handler(commands=["task_list"])
+async def task_list(message: Message):
+    user = get_user(message.chat.id)
+    if not user:
+        return await message.answer("Сначала надо зарегистрироваться. \n"
+                                    "``` /register {имя} {номер-комнаты}```\n")
+
+    pos = get_possibilities(user["role"])
+    if "duty" in pos:
+        return await message.answer(f"1. Проверить на всех ли этажах выключены утюги.\n"
+                                    f"2. Проверить отсутствие вещей в стиральных машинах.\n"
+                                    f"3. Проверить чистоту в коворкингах.\n"
+                                    f"4. Проверить чистоту на кухне.\n"
+                                    f"5. Вынести мусор из коворкингов и кухни.\n"
+                                    f"6. Проверить соответствие положения пылесоса данным в боте.\n"
+                                    f"Если данные не соответствуют, измените их с помощью команды /set_hoover")
+
+
+@dp.message_handler(content_types=ContentType.DOCUMENT)
+async def download_file(message: Message):
+    if is_admin(message.chat.id) and message.document:
+        if "xls" in message.document.file_name:
+            await message.document.download("data/data.xlsx")
+            return await message.answer("downloaded.")
+        return await message.answer("file should be xlsx.")
+
+
 @dp.message_handler()
 async def on_message(message: Message):
     global hoover_state, response, stop_rent_user
+
     if message.chat.id == stop_rent_user:
         if response["floor"] == 0:
             if len(message.text) > 1 or not (message.text in "12345"):
